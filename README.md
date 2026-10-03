@@ -12,6 +12,7 @@
 - 2～4 个已保存场景可按给定顺序**拼接（concat）为连续播放场景**：`POST /scenes/concat` 接收非空 `target_scene_id` 与 2～4 段（每段给出非空 `scene_id`、正整数 `expected_revision` 与正整数 `duration_ms`，同源可重复，整数拒绝布尔值和字符串）；各源轨道数须相同，每段时长不得小于该源字幕的最大 `end_ms`，拼接后字幕总数 ≤ 12。字幕起止时间加上之前各段时长之和，按段序、源顺序排列，id 为“段号:段内序号”（均从 1 起），speaker 不变，源实际分轨写入 `locked_track`，`changes` 按拼接后同说话人时间相邻字幕计算（跨段相邻计入）。读取与提交时均核对全部源版本，**提交核对和目标创建在同一事务内一同生效**：源不存在 404、版本不符或目标已占用 409、其余非法输入 422；失败不留目标、不改源及播放会话。成功保存为版本 1 并返回完整场景，可直接用原读取、修订及播放接口操作。
 - 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。接纳是完整操作：场景读取、已开始字幕校验、分轨重算与会话替换在会话锁内串行生效，迟到的接纳请求读到的是轮到它生效时的场景快照，不会把会话回写到旧版本。除原 `/advance` 外，另有 `/events` 事件推进：一次推进返回跨过的**全部**字幕进入/退出事件，短字幕即使在两次采样之间开始又结束也不会漏掉。播放时还可通过 `/hidden_speakers` **临时隐藏指定说话人的字幕（仅影响该会话、不持久化）**：按 `speaker` 精确匹配，提交无重复非空字符串数组（空数组清除，允许尚未出现者）；切换时以当前游标的左闭右开活动区间判定，原可见而现隐藏者发 `exit`、原隐藏而现可见者发 `enter`（时刻为当前游标，先 `exit` 后 `enter`，同类按会话字幕顺序，无变化则无事件）；设置后推进与事件推进的活动字幕、事件均排除隐藏者而游标照常推进，隐藏默认空、接纳后保留，完整快照与分轨不受影响。播放结束以 `POST /sessions/{id}/finish` **一次完整操作取回最终快照并释放会话**：成功响应沿用创建会话的全部字段，快照取自轮到结束时的会话（不读取尚未接纳的场景修订），未知会话返回 404；结束与同会话的推进、事件推进、隐藏切换、接纳串行生效，并发结束最多一次成功，结束后针对该 id 的一切请求（含已取得会话引用但尚未生效的请求）均返回 404；不改动源场景、其他会话或此前返回的快照，不保存结束记录、不跨重启恢复。
 - 播放会话可开启一个**补取通道（channel）**，让显示端在**推进响应丢失后仍能补取未确认的字幕变更**：`POST /sessions/{id}/channel` 每会话开启一个内存通道（重复开启 409），返回当前可见 `active` 与序号 0；此后普通推进、事件推进与隐藏切换产生的全部 enter/exit 按事件字段与排序入队，`seq` 从 1 连续编号，短字幕不漏记，接纳不重写已排队内容。`POST /sessions/{id}/channel/fetch` 提交 `ack_seq`（严格非负整数，拒绝布尔值与字符串）补取：只能确认此前补取已返回的最大 `seq` 以内的前缀（越界 422，旧确认不回退），返回确认位置与剩余未确认事件（按 `seq` 递增，重复补取内容与序号不变）。状态变更与入队一同生效，开启、补取与既有会话操作完整串行，失败不改会话或通道；结束会话清除通道，未知或已结束会话、未开启通道均 404。通道仅内存态：不跨重启恢复、不做后台推送，旧接口响应不变。**通道共享容量**由环境变量 `CHANNEL_EVENT_LIMIT` 配置（正整数，默认 1024，非法配置拒绝启动，可在 Compose 中配置）：它是**单进程内所有会话未确认事件总量**的上限。普通推进、事件推进与隐藏切换须按**本次实际生成的事件数**原子申请共享容量，申请与状态变更、`seq` 分配、完整入队一同生效；容量不足立即返回 **503**——不推进游标、不改变隐藏集合、不消费 `seq`、不部分入队。**未开启通道的操作不占容量**；**无事件的操作在满额时仍可执行**。容量**仅在补取确认并删除前缀时**按删除数量释放（纯读取与旧确认不释放），或在**结束会话时释放该通道剩余队列**（重复/并发结束不重复释放）；释放后被 503 拒绝的原请求可原样重试。
+- 已开启补取通道的会话还可启动**自动播放（autoplay）**：客户端不再逐次提交推进时间，进程内后台驱动**每 50 毫秒**按真实经过时间自动推进，目标为**本段起始游标 + 单调时钟经过的整毫秒**（`time.monotonic`，毫秒取整）。HTTP 接口按 `session_id` **启动 / 暂停 / 恢复 / 查询**，返回 `idle`（未启动）/ `running`（运行）/ `paused`（暂停）/ `blocked`（满额阻塞）状态与当前游标。启动仅限**已开补取通道且从未启动**的会话（未开通道或已启动返回 409）；暂停仅限 running，恢复仅限 paused 或 blocked，其余状态迁移均 409；未知或已结束会话 404。**暂停、阻塞不计时**，恢复以保留游标作为新一段起点重新计时，**不追赶**停顿时间。后台推进沿用事件窗口、隐藏过滤、排序、`seq` 与共享容量的**全部既有规则**：一次推进的整批事件原子入队，共享容量不足时整批转为 `blocked`——游标、`seq` 与队列保持原样；确认释放容量后**必须显式恢复**才继续，且不追赶停顿。**运行中两种手动推进（`/advance`、`/events`）返回 409**，未启动/暂停/阻塞时仍可手动推进；隐藏切换、接纳、补取等其他既有会话操作在四种状态下仍可用并与后台推进完整串行。暂停返回后在途后台任务进锁即见非 running，不可能再推进；结束会话即停止对它的驱动（注册表移除后旧任务取不到它）、按原规则释放通道容量，之后该 id 一切请求 404。自动播放驱动状态**仅存单进程内存**，不跨重启，旧接口的请求与响应完全不变。
 
 ## 一条命令启动
 
@@ -1652,6 +1653,165 @@ curl -s http://localhost:8080/health
 # {"status":"ok"}
 ```
 
+## 自动播放（autoplay）：按真实经过时间推进
+
+正常播放需要显示端反复提交 `/advance` 或 `/events` 推进游标。开启补取通道的会话还可以改为**自动播放**：启动后由服务进程内的后台驱动**每 50 毫秒**尝试推进一次，游标目标为**本段起始游标加上单调时钟经过的整毫秒**，客户端只需轮询/补取，不再逐次提交时间。自动播放沿用播放会话与补取通道的全部既有语义——事件窗口（旧游标, 目标]、隐藏过滤、时刻升序/同刻先 exit 后 enter/同类按会话顺序、短字幕不漏、`seq` 连续编号、共享容量原子申请——客户端通过通道即可拿到自动推进产生的全部 enter/exit。
+
+控制接口（均无请求体）：
+
+| 接口 | 方法 | 允许的当前状态 | 成功后状态 |
+| --- | --- | --- | --- |
+| `/sessions/{id}/autoplay/start` | POST | `idle` 且**已开启补取通道** | `running` |
+| `/sessions/{id}/autoplay/pause` | POST | `running` | `paused` |
+| `/sessions/{id}/autoplay/resume` | POST | `paused`、`blocked` | `running` |
+| `/sessions/{id}/autoplay` | GET | 任意 | 不变 |
+
+- 响应统一为 `{"session_id", "status", "cursor_ms"}`；状态不在允许集合时返回 **409**（`detail.reason` 给出原因：`channel_missing`/`already_started`/`not_started`/`pause_only_running`/`resume_paused_or_blocked`），未知或已结束会话返回 **404**。
+- **启动以当前游标为本段起始游标**（启动前可先手动推进到任意时刻）；后台目标 = 起始游标 + `time.monotonic()` 经过的整毫秒。
+- **暂停、阻塞不计时**：暂停保留后台最后一次成功推进的游标（最多一拍粒度），恢复以保留游标作为**新一段起点**重新计时，**不追赶**暂停或阻塞期间流逝的时间；恢复后各拍窗口仍从保留游标算起，停顿区间内的事件会在恢复后的正常推进中入队，不会丢失。
+- **满额阻塞**：某一拍要整批入队的事件数超过共享容量剩余时，这一拍**整批失败**并转为 `blocked`：游标不推进、`seq` 不分配、事件不部分入队（与手动推进的 503 同一条原子规则）。阻塞后后台不再推进该会话，直到客户端用 `/channel/fetch` 确认前缀（或结束其他会话）腾出容量，再**显式 `resume`**；若恢复后容量仍不足，下一拍再次回到 `blocked`。
+- **运行中（running）手动 `/advance`、`/events` 返回 409**（`reason: manual_advance_while_running`）；`idle`/`paused`/`blocked` 下两种手动推进仍可正常使用（阻塞满额时依旧按 503 失败）。隐藏切换、接纳、通道开启/补取、结束等其他操作在四种状态下都可用，并在会话锁内与后台推进完整串行。
+- **结束**：`/finish` 立即停止对该会话的驱动（注册表移除后在途后台任务取不到它）、按原规则一次性释放通道剩余容量，之后该 id 的一切请求（含四个自动播放接口）均 404。并发结束仍最多一次成功。
+- 自动播放的全部驱动状态（running/paused/blocked、本段起点与单调时钟读数）**只存在于本进程内存**：不持久化、不跨重启；重启后会话本身即按未知处理（404）。创建、推进、事件推进、隐藏、通道、接纳、结束等旧接口的路径、请求与响应字段保持不变。
+
+### 示例 29：启动、观察自动推进、暂停、恢复
+
+沿用示例 26 的 `scene-chan`（s1 `[0,1000)`、s2 `[800,3000)` 锁轨 2、s3 `[1000,2500)`）。自动播放必须先开通道：
+
+```bash
+SID=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"scene_id": "scene-chan"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+
+# 未开通道直接启动 -> 409
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/autoplay/start
+# 409
+
+# 开启补取通道（初始 active 为 s1，seq 从 0 起）
+curl -s -X POST http://localhost:8080/sessions/$SID/channel
+
+# 启动自动播放：状态 running、游标 0
+curl -s -X POST http://localhost:8080/sessions/$SID/autoplay/start
+# {"session_id":"…","status":"running","cursor_ms":0}
+
+# 约 0.3 秒后查询：游标随真实时间增长（后台每 50ms 一拍）
+sleep 0.3
+curl -s http://localhost:8080/sessions/$SID/autoplay
+# {"session_id":"…","status":"running","cursor_ms":301}
+
+# 运行中手动推进被拒绝：409
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/advance \
+  -H 'Content-Type: application/json' -d '{"time_ms": 9999}'
+# 409
+
+# 期间自动推进产生的事件已按既有规则入队（800ms 时 s2 enter 在前）
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 0}'
+# {"…","acked_seq":0,"events":[{"seq":1,"id":"s2",…,"time_ms":800,"type":"enter"}, …]}
+
+# 暂停：保留游标，暂停期间不计时
+curl -s -X POST http://localhost:8080/sessions/$SID/autoplay/pause
+# {"session_id":"…","status":"paused","cursor_ms":301}
+sleep 1
+curl -s http://localhost:8080/sessions/$SID/autoplay   # 1 秒后游标仍是 301
+# {"…","status":"paused","cursor_ms":301}
+
+# 运行中才能暂停：暂停中再暂停 -> 409
+curl -s -i -X POST http://localhost:8080/sessions/$SID/autoplay/pause
+# HTTP/1.1 409 Conflict
+# {"detail":{"message":"暂停仅限运行中的自动播放会话",
+#            "reason":"pause_only_running","status":"paused"}}
+
+# 恢复：从保留游标 301 重新计时，不补这 1 秒
+curl -s -X POST http://localhost:8080/sessions/$SID/autoplay/resume
+# {"…","status":"running","cursor_ms":301}
+sleep 0.1
+curl -s http://localhost:8080/sessions/$SID/autoplay   # 约 400，而不是 1300
+# {"…","status":"running","cursor_ms":402}
+
+# 结束：停止驱动、释放通道容量，之后自动播放接口同样 404
+curl -s -o /dev/null -X POST http://localhost:8080/sessions/$SID/finish
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080/sessions/$SID/autoplay
+# 404
+```
+
+### 示例 30：满额转阻塞，确认释放后显式恢复（不追赶）
+
+把共享容量调小（`CHANNEL_EVENT_LIMIT=4`，本地可 `CHANNEL_EVENT_LIMIT=4 uvicorn app.main:app --port 8080`；Compose 中改 `environment`）。用一段短字幕密集的场景，使某一拍的整批事件超过剩余容量：
+
+```bash
+curl -s -X PUT http://localhost:8080/scenes/scene-auto-full \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 0,
+    "subtitles": [
+      {"id": "d0", "speaker": "D0", "start_ms": 100, "end_ms": 102},
+      {"id": "d1", "speaker": "D1", "start_ms": 101, "end_ms": 103},
+      {"id": "d2", "speaker": "D2", "start_ms": 102, "end_ms": 104},
+      {"id": "d3", "speaker": "D3", "start_ms": 103, "end_ms": 105}
+    ]
+  }' >/dev/null
+
+SID=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' -d '{"scene_id": "scene-auto-full"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+curl -s -X POST http://localhost:8080/sessions/$SID/channel >/dev/null
+curl -s -X POST http://localhost:8080/sessions/$SID/autoplay/start >/dev/null
+
+# 等待后台进入 blocked（轮询查询接口）
+for i in $(seq 1 50); do
+  ST=$(curl -s http://localhost:8080/sessions/$SID/autoplay)
+  echo "$ST" | grep -q '"blocked"' && break
+  sleep 0.02
+done
+echo "$ST"
+# {"session_id":"…","status":"blocked","cursor_ms":100}
+
+# 阻塞不计时：游标停在保留值
+sleep 0.3
+curl -s http://localhost:8080/sessions/$SID/autoplay
+# {"…","status":"blocked","cursor_ms":100}
+
+# 阻塞时暂停/启动均 409；恢复只接受 paused 或 blocked（200 前先看队列）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/autoplay/pause
+# 409
+
+# 补取已入队的前缀（seq 连续、无空洞），确认后释放共享容量
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 0}'
+# {"…","acked_seq":0,"events":[ … 已入队的若干条，seq 从 1 起连续 … ]}
+
+# 假设上一步返回了 N 条，确认这 N 条（N 换成实际数量）；确认后仍 blocked，
+# 不会因容量空出来就自动恢复，也不会追赶这 0.3 秒
+N=4
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d "{\"ack_seq\": $N}" >/dev/null
+sleep 0.2
+curl -s http://localhost:8080/sessions/$SID/autoplay
+# {"…","status":"blocked","cursor_ms":100}
+
+# 必须显式恢复：从保留游标 100 重新计时；容量已够，后续各拍整批入队
+curl -s -X POST http://localhost:8080/sessions/$SID/autoplay/resume
+# {"…","status":"running","cursor_ms":100}
+sleep 0.1
+curl -s http://localhost:8080/sessions/$SID/autoplay
+# {"…","status":"running","cursor_ms":198}
+
+# 恢复后的事件接着确认位置之后连续编号（无空洞、不重号）
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d "{\"ack_seq\": $N}"
+# {"…","acked_seq":4,"events":[{"seq":5, …}, {"seq":6, …}, …]}
+```
+
+要点：满额的那一拍**整批失败**（不推进游标、不消费 `seq`、不部分入队，等价于手动推进的 503 语义但由后台转为 `blocked` 状态）；确认前缀只是腾出容量，会话**保持 blocked**，显式 `resume` 后从保留游标继续，停顿期间的墙钟时间**不会**被追回来。
+
+### 与既有操作的关系
+
+- `idle`（未启动）时一切旧行为不变：手动 `/advance`、`/events`、隐藏、接纳、通道、结束都照旧；自动播放是**叠加**在通道之上的可选驱动，不开通道即与旧版本完全一致。
+- `running` 时仅禁止两种手动推进（409）；隐藏切换照常（与后台推进串行，显示变更事件照常入队），`/accept` 照常（接纳后后台按新快照继续推进，已开始字幕冻结规则不变），`/channel/fetch` 照常拉取自动推进产生的事件。
+- `paused`/`blocked` 时可手动推进（满额仍 503）、可切换隐藏、可接纳、可补取；这些操作改变的游标就是随后 `resume` 的本段起始游标。
+
 ## 本地开发与测试（不使用 Docker）
 
 需 Python 3.11+：
@@ -1686,10 +1846,10 @@ python tests/test_solver.py
 
 ```
 app/
-  main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip、场景拼接 /scenes/concat、会话结束 /sessions/{id}/finish 与补取通道 /sessions/{id}/channel(/fetch)
+  main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip、场景拼接 /scenes/concat、会话结束 /sessions/{id}/finish、补取通道 /sessions/{id}/channel(/fetch) 与自动播放 /sessions/{id}/autoplay/(start|pause|resume)
   solver.py    # 纯 Python 求解器与业务校验（无第三方依赖）
   storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制；片段/拼接核对全部源版本与创建目标为同一事务）
-  playback.py  # 播放会话：单进程内存态，推进/事件推进/临时隐藏说话人/补取通道/接纳/结束串行化（接纳含场景读取的完整操作；结束一次取回最终快照并移除注册表；通道记录全部 enter/exit 供丢响应后补取确认；CHANNEL_EVENT_LIMIT 共享容量随生产原子申请、确认前缀/结束释放）与保轨重算
+  playback.py  # 播放会话：单进程内存态，推进/事件推进/临时隐藏说话人/补取通道/接纳/结束串行化（接纳含场景读取的完整操作；结束一次取回最终快照并移除注册表；通道记录全部 enter/exit 供丢响应后补取确认；CHANNEL_EVENT_LIMIT 共享容量随生产原子申请、确认前缀/结束释放）、自动播放（每 50ms 按单调时钟整批推进，满额转 blocked、确认后显式恢复，暂停/阻塞不计时、不追赶；状态机 idle/running/paused/blocked）与保轨重算
 tests/
   conftest.py            # pytest 夹具（场景接口使用临时数据库、会话隔离）
   test_solver.py         # 求解器单元测试
@@ -1702,6 +1862,7 @@ tests/
   test_finish.py         # 会话结束：最终快照字段、404、不读未接纳修订、并发结束唯一成功、等待中的推进/事件推进/接纳/重复结束可控交错
   test_channel.py        # 补取通道：开启/重复开启、三类操作入队与短字幕、ack 边界与不回退、重复补取不变、结束清除、404/409/422、串行化
   test_channel_limit.py  # 通道共享容量：默认/配置/非法拒绝启动、生产原子申请与满额 503（游标/隐藏集合/seq/队列不变）、无事件与未开启通道不占、确认前缀释放/读取与旧确认不释放、结束一次性释放、跨会话总额、并发不越限/不死锁/不泄漏、重试
+  test_autoplay.py       # 自动播放：状态机 409/404、真实时间推进与本段起点、暂停不计时/恢复不追赶、满额整批转 blocked（游标/seq/队列不变）/确认后显式恢复、运行中手动推进 409、其他操作串行、结束停止驱动并释放容量（含注入时钟的确定性管理器测试）
 Dockerfile
 docker-compose.yml   # 挂载 scenes-data 具名卷到 /data；CHANNEL_EVENT_LIMIT 配置通道共享容量（默认 1024）
 requirements.txt / requirements-dev.txt

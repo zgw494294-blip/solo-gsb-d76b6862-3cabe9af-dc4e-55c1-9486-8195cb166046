@@ -49,6 +49,21 @@
   无事件操作（0 个名额）在满额时仍可执行。容量仅在补取确认并删除前缀
   时按删除数量释放（纯读取与旧确认不释放），或在结束会话时释放该通道
   的剩余队列（重复/并发结束只释放一次）；释放后原请求可原样重试。
+- 自动播放（autoplay）：已开启补取通道且从未启动的会话可启动后台自动
+  播放，客户端不再逐次提交推进时间。进程内唯一的守护驱动线程每 50ms
+  尝试推进一次，目标游标 = 本段起始游标 + 自本段起点单调时钟
+  （time.monotonic）经过的整毫秒；暂停、阻塞不计时，恢复以保留游标作为
+  新一段起点重新计时，不追赶停顿时间。后台推进沿用事件窗口、隐藏过滤、
+  排序、seq 与共享容量的全部既有规则：一次推进整批入队，容量不足整批
+  转为 blocked——游标、seq 与队列保持原样，确认释放容量后须显式恢复。
+  控制接口为启动（start，仅 idle 且已开通道）、暂停（pause，仅 running）、
+  恢复（resume，仅 paused/blocked）与查询（status，返回 idle/running/
+  paused/blocked 与游标）；状态不符抛 AutoplayConflict（HTTP 409），
+  未知会话 404。运行中两种手动推进（advance/advance_events）抛
+  AutoplayConflict（409），其他既有会话操作在四种状态下仍可用并完整
+  串行。暂停返回后在途后台任务进锁即见非 running，不会再推进；结束会话
+  即停止对它的驱动（注册表移除后旧任务取不到它），按原规则释放容量，
+  之后一切请求 404。驱动状态仅存于本进程内存，不跨重启，旧接口响应不变。
 
 会话只存在于本进程内存中，不随重启保留。同一会话上的推进、事件推进、
 隐藏切换、接纳、结束与补取通道的开启/补取通过会话级互斥锁串行化：
@@ -64,12 +79,44 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .solver import Subtitle, solve
 from .storage import SceneRecord
+
+
+# 自动播放后台尝试推进的节拍（秒）：后台驱动每 50 毫秒尝试推进一次。
+AUTOPLAY_TICK_INTERVAL_S = 0.05
+
+# 自动播放状态（驱动状态仅存于本进程内存，不随重启保留）：
+# idle 未启动；running 运行中（后台按单调时钟推进游标）；
+# paused 已暂停（暂停不计时，恢复从保留游标重新计时）；
+# blocked 因补取通道共享容量满额而阻塞（游标、seq 与队列不变，
+# 确认释放容量后须显式恢复，不追赶停顿期间流逝的时间）。
+AUTOPLAY_IDLE = "idle"
+AUTOPLAY_RUNNING = "running"
+AUTOPLAY_PAUSED = "paused"
+AUTOPLAY_BLOCKED = "blocked"
+
+
+class AutoplayConflict(Exception):
+    """自动播放状态迁移不被允许（对应 HTTP 409）。
+
+    reason 取值：
+    - channel_missing：仅已开启补取通道的会话可启动自动播放；
+    - already_started：启动仅限从未启动的会话（暂停/阻塞后不能重新启动）；
+    - not_started：暂停、恢复仅限已启动的会话；
+    - pause_only_running：暂停仅允许运行中（运行态）的会话；
+    - resume_paused_or_blocked：恢复仅允许暂停或阻塞的会话。
+    """
+
+    def __init__(self, reason: str, status: str) -> None:
+        self.reason = reason
+        self.status = status
+        super().__init__(f"自动播放状态迁移冲突：{reason}（当前状态 {status}）")
 
 
 # 补取通道共享容量（单进程内所有会话的未确认事件总量）的默认上限。
@@ -301,6 +348,14 @@ class PlaybackSession:
     # 结束墓碑：finish 在会话锁内置为 True 并移除注册表条目。此后即使
     # 仍持有本对象引用的在途请求，在锁内读到 closed 也一律按 404 失败。
     closed: bool = False
+    # 自动播放驱动状态（仅内存态，不跨重启保留）：
+    # autoplay_status 取 idle/running/paused/blocked；base_cursor_ms 为本段
+    # 起始游标（启动时的当前游标，或暂停/阻塞保留的游标）；base_monotonic_s
+    # 为本段起点的单调时钟读数（time.monotonic()）。暂停与阻塞不计时——
+    # 恢复时以保留游标作为新一段的起点重新计时，不追赶停顿时间。
+    autoplay_status: str = AUTOPLAY_IDLE
+    base_cursor_ms: int = 0
+    base_monotonic_s: float = 0.0
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def active(self) -> List[Dict[str, Any]]:
@@ -330,6 +385,14 @@ class PlaybackSession:
                 {"id": s["id"], "track": t}
                 for s, t in zip(self.subtitles, self.tracks)
             ],
+        }
+
+    def autoplay_state(self) -> Dict[str, Any]:
+        """自动播放控制状态（调用方须持有会话锁）。"""
+        return {
+            "session_id": self.session_id,
+            "status": self.autoplay_status,
+            "cursor_ms": self.cursor_ms,
         }
 
 
@@ -409,7 +472,11 @@ class PlaybackManager:
     反向等待、不会死锁。
     """
 
-    def __init__(self, channel_event_limit: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        channel_event_limit: Optional[int] = None,
+        autoplay_tick_interval_s: Optional[float] = AUTOPLAY_TICK_INTERVAL_S,
+    ) -> None:
         self._sessions: Dict[str, PlaybackSession] = {}
         self._registry_lock = threading.Lock()
         if channel_event_limit is None:
@@ -418,6 +485,14 @@ class PlaybackManager:
             )
         # 单进程内所有会话的补取通道共用同一份未确认事件容量。
         self._channel_capacity = ChannelCapacity(channel_event_limit)
+        # 自动播放后台驱动：进程内唯一的守护线程，每 tick 间隔（默认 50ms）
+        # 对所有运行中的会话尝试推进一次。驱动状态只存于本进程内存。
+        # autoplay_tick_interval_s=None 表示不启动后台线程（仅显式 tick，
+        # 供确定性测试使用）。
+        self._autoplay_tick_interval_s = autoplay_tick_interval_s
+        self._driver_thread: Optional[threading.Thread] = None
+        self._driver_wake = threading.Event()
+        self._driver_stop = threading.Event()
 
     @property
     def channel_capacity(self) -> ChannelCapacity:
@@ -446,6 +521,39 @@ class PlaybackManager:
         with self._registry_lock:
             return self._sessions.get(session_id)
 
+    def _advance_locked(
+        self, session: PlaybackSession, time_ms: int, include_events: bool
+    ) -> Dict[str, Any]:
+        """已持有会话锁时的推进实现：事件窗口、容量申请、游标更新原子生效。
+
+        include_events=False（普通推进）时响应不含事件，但已开启补取通道
+        仍要完整记录跨过的 enter/exit。容量申请成功之前不做任何状态变更。
+        """
+        old_cursor = session.cursor_ms
+        if session.channel is not None:
+            # 普通推进的响应不含事件，但补取通道要完整记录跨过的 enter/exit
+            events = _window_events(session, old_cursor, time_ms)
+            # 容量申请成功之前不推进游标、不分配/消费 seq、不入队；
+            # 0 个事件不占名额，满额时仍可推进。
+            self._channel_capacity.reserve(len(events))
+        else:
+            # 未开启通道：事件推进仍需事件用于响应，普通推进无需计算。
+            events = (
+                _window_events(session, old_cursor, time_ms)
+                if include_events
+                else []
+            )
+        session.cursor_ms = time_ms
+        _channel_append(session, events)
+        return {
+            "session_id": session.session_id,
+            "scene_id": session.scene_id,
+            "source_revision": session.source_revision,
+            "cursor_ms": session.cursor_ms,
+            "active": session.active(),
+            **({"events": events} if include_events else {}),
+        }
+
     def advance(self, session: PlaybackSession, time_ms: int) -> Dict[str, Any]:
         """推进游标（只能不减），返回源版本、游标与活动字幕及轨道。
 
@@ -454,31 +562,21 @@ class PlaybackManager:
         更新一同生效。生产前先按本次实际生成的事件数从共享容量原子申请：
         容量不足抛 ChannelCapacityExhausted（503），此时尚未推进游标、
         尚未分配/消费 seq、尚未入队，会话与通道保持原样，客户端可重试。
+
+        自动播放运行中（running）的会话由后台按真实时间驱动，手动推进
+        抛 AutoplayConflict（409）；未启动、暂停、阻塞时仍可手动推进
+        （阻塞时满额同样按 503 失败）。
         """
         with session.lock:
             if session.closed:
                 raise SessionFinished(session.session_id)
+            if session.autoplay_status == AUTOPLAY_RUNNING:
+                raise AutoplayConflict(
+                    "manual_advance_while_running", session.autoplay_status
+                )
             if time_ms < session.cursor_ms:
                 raise CursorRegression(session.cursor_ms, time_ms)
-            old_cursor = session.cursor_ms
-            # 普通推进的响应不含事件，但补取通道要完整记录跨过的 enter/exit
-            pending = (
-                _window_events(session, old_cursor, time_ms)
-                if session.channel is not None
-                else []
-            )
-            # 容量申请成功之前不做任何状态变更；0 个事件（含未开启通道）
-            # 不占名额，满额时仍可推进。
-            self._channel_capacity.reserve(len(pending))
-            session.cursor_ms = time_ms
-            _channel_append(session, pending)
-            return {
-                "session_id": session.session_id,
-                "scene_id": session.scene_id,
-                "source_revision": session.source_revision,
-                "cursor_ms": session.cursor_ms,
-                "active": session.active(),
-            }
+            return self._advance_locked(session, time_ms, False)
 
     def advance_events(
         self, session: PlaybackSession, time_ms: int
@@ -493,34 +591,25 @@ class PlaybackManager:
         进入；同类按会话字幕顺序。time_ms 等于当前游标时事件为空。
 
         事件生成、游标更新与活动字幕计算基于同一份会话快照，在会话锁
-        内一次完成，与推进、接纳、结束完整串行。倒退抛 CursorRegression，
-        会话保持不变。事件不保存历史、不提供重放。隐藏说话人的字幕不
-        进入 active，也不产生事件；游标仍照常推进。若已开启补取通道，
-        本次事件在游标更新的同一会话锁内按序入队：入队前先按事件数原子
-        申请共享容量，不足抛 ChannelCapacityExhausted（503）——不推进
-        游标、不分配/消费 seq、不入队，会话与通道保持原样。
+        内一次完成，与推进、接纳、结束、后台自动推进完整串行。倒退抛
+        CursorRegression，会话保持不变。事件不保存历史、不提供重放。
+        隐藏说话人的字幕不进入 active，也不产生事件；游标仍照常推进。
+        若已开启补取通道，本次事件在游标更新的同一会话锁内按序入队：
+        入队前先按事件数原子申请共享容量，不足抛 ChannelCapacityExhausted
+        （503）——不推进游标、不分配/消费 seq、不入队，会话与通道保持
+        原样。自动播放运行中的会话不接受手动事件推进（AutoplayConflict
+        -> 409）。
         """
         with session.lock:
             if session.closed:
                 raise SessionFinished(session.session_id)
+            if session.autoplay_status == AUTOPLAY_RUNNING:
+                raise AutoplayConflict(
+                    "manual_advance_while_running", session.autoplay_status
+                )
             if time_ms < session.cursor_ms:
                 raise CursorRegression(session.cursor_ms, time_ms)
-            old_cursor = session.cursor_ms
-            events = _window_events(session, old_cursor, time_ms)
-            # 未开启通道不占容量；开启后按本次实际事件数申请，0 个事件
-            # 不占名额（满额时仍可等时推进）。
-            if session.channel is not None:
-                self._channel_capacity.reserve(len(events))
-            session.cursor_ms = time_ms
-            _channel_append(session, events)
-            return {
-                "session_id": session.session_id,
-                "scene_id": session.scene_id,
-                "source_revision": session.source_revision,
-                "cursor_ms": session.cursor_ms,
-                "events": events,
-                "active": session.active(),
-            }
+            return self._advance_locked(session, time_ms, True)
 
     def set_hidden_speakers(
         self, session: PlaybackSession, hidden_speakers: List[str]
@@ -669,6 +758,200 @@ class PlaybackManager:
                 "acked_seq": channel.acked_seq,
                 "events": remaining,
             }
+
+    # ------------------------------------------------------------------
+    # 自动播放：按真实经过时间推进（单进程内存态后台驱动）
+    # ------------------------------------------------------------------
+
+    def _ensure_driver_locked(self) -> None:
+        """确保后台驱动线程在运行（调用方持有注册表锁）。
+
+        启动/恢复把状态改为 running 后调用：若驱动尚未启动（或上一个驱动
+        已正常退出），现场创建唯一的守护线程。先在线程对象可见后再唤醒，
+        避免“驱动已退出、会话却停在 running 无人推进”的丢唤醒窗口。
+        tick 间隔配置为 None（仅显式 tick 的确定性模式）时不启动线程。
+        """
+        if self._autoplay_tick_interval_s is None:
+            return
+        existing = self._driver_thread
+        if existing is not None and existing.is_alive():
+            return
+        if self._driver_stop.is_set():
+            # 本管理器已随 reset_playback 退役；正常路径不可达（reset 会
+            # 丢弃整个管理器），此处防御性地不复活旧驱动。
+            return
+        thread = threading.Thread(
+            target=self._driver_loop,
+            name="playback-autoplay-driver",
+            daemon=True,
+        )
+        self._driver_thread = thread
+        thread.start()
+        self._driver_wake.set()
+
+    def _driver_loop(self) -> None:
+        """后台驱动：每 50ms 对所有 running 会话尝试推进一次。
+
+        被停止事件或启动/恢复唤醒时立即跑一拍；每拍先取注册表快照再逐个
+        进入会话锁，与全部既有会话操作完整串行。会话结束后注册表即无其
+        条目，旧的后台任务不可能再推进它。
+        """
+        while not self._driver_stop.is_set():
+            self._driver_wake.wait(self._autoplay_tick_interval_s)
+            self._driver_wake.clear()
+            if self._driver_stop.is_set():
+                return
+            with self._registry_lock:
+                sessions = list(self._sessions.values())
+            for session in sessions:
+                try:
+                    self._tick_session(session)
+                except SessionFinished:
+                    # 在取注册表快照与进锁之间会话被结束：按墓碑忽略
+                    continue
+
+    def _tick_session(
+        self, session: PlaybackSession, now: Optional[float] = None
+    ) -> None:
+        """对单个会话尝试推进一拍（仅 running 生效）。
+
+        now 可注入单调时钟读数（秒）以便确定性测试；缺省取 time.monotonic()。
+        目标游标 = 本段起始游标 + 自本段起点经过的整毫秒；暂停、阻塞不计时
+        （它们已把状态移出 running），恢复从保留游标开新一段。目标不大于
+        当前游标（首拍不足 1ms）时不做任何变更。一次推进把整批事件原子
+        入队：共享容量不足时整批转为 blocked——游标、seq 与队列保持原样，
+        确认释放容量后须显式 resume，不追赶停顿时间。
+        """
+        if now is None:
+            now = time.monotonic()
+        with session.lock:
+            if session.closed:
+                raise SessionFinished(session.session_id)
+            if session.autoplay_status != AUTOPLAY_RUNNING:
+                return
+            elapsed_ms = int((now - session.base_monotonic_s) * 1000)
+            target = session.base_cursor_ms + elapsed_ms
+            if target <= session.cursor_ms:
+                return
+            try:
+                # 与普通手动推进完全相同的窗口、隐藏过滤、排序、seq 与
+                # 共享容量语义；整批事件随游标更新一同生效。
+                self._advance_locked(session, target, False)
+            except ChannelCapacityExhausted:
+                # 整批无法入队：游标、seq 与队列均未改变（容量申请先于
+                # 一切状态变更）。转为阻塞，保留游标作为恢复后的起点。
+                session.autoplay_status = AUTOPLAY_BLOCKED
+
+    def tick_autoplay(self, now: Optional[float] = None) -> None:
+        """显式驱动一拍：对所有注册表中的会话尝试推进（确定性测试用）。
+
+        now 为注入的单调时钟读数（秒）；与后台线程的每拍行为完全一致。
+        """
+        with self._registry_lock:
+            sessions = list(self._sessions.values())
+        for session in sessions:
+            try:
+                self._tick_session(session, now)
+            except SessionFinished:
+                continue
+
+    def start_autoplay(
+        self, session: PlaybackSession, now: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """启动自动播放：仅限已开启补取通道且从未启动的会话。
+
+        以当前游标为本段起始游标记录单调时钟起点并置为 running，后台驱动
+        随即按真实经过时间推进（确定性模式下由显式 tick 驱动）。未开启
+        通道抛 AutoplayConflict(channel_missing)；已启动（含 running/
+        paused/blocked）抛 AutoplayConflict(already_started)；会话已结束
+        抛 SessionFinished。
+        """
+        if now is None:
+            now = time.monotonic()
+        with session.lock:
+            if session.closed:
+                raise SessionFinished(session.session_id)
+            if session.channel is None:
+                raise AutoplayConflict(
+                    "channel_missing", session.autoplay_status
+                )
+            if session.autoplay_status != AUTOPLAY_IDLE:
+                raise AutoplayConflict(
+                    "already_started", session.autoplay_status
+                )
+            session.autoplay_status = AUTOPLAY_RUNNING
+            session.base_cursor_ms = session.cursor_ms
+            session.base_monotonic_s = now
+            with self._registry_lock:
+                self._ensure_driver_locked()
+            return session.autoplay_state()
+
+    def pause_autoplay(self, session: PlaybackSession) -> Dict[str, Any]:
+        """暂停自动播放：仅限 running；暂停期间不计时。
+
+        不做收尾推进：保留游标停留在后台最后一次成功推进的值（最多一个
+        50ms 拍的粒度），状态置为 paused。此后任何已在途的后台 tick 进锁
+        后看到非 running 都直接返回，因此暂停返回后旧任务不可能再推进本
+        会话；尚未跨过的不到一拍的时间不补发——恢复时以保留游标作为新一段
+        起点重新计时，该区间内的事件仍会落在恢复后的推进窗口里正常入队。
+        未启动抛 not_started；paused/blocked 抛 pause_only_running。
+        """
+        with session.lock:
+            if session.closed:
+                raise SessionFinished(session.session_id)
+            status = session.autoplay_status
+            if status == AUTOPLAY_IDLE:
+                raise AutoplayConflict("not_started", status)
+            if status != AUTOPLAY_RUNNING:
+                raise AutoplayConflict("pause_only_running", status)
+            session.autoplay_status = AUTOPLAY_PAUSED
+            return session.autoplay_state()
+
+    def resume_autoplay(
+        self, session: PlaybackSession, now: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """恢复自动播放：仅限 paused 或 blocked；从保留游标重新计时。
+
+        以当前（保留的）游标作为新一段起点重新记录单调时钟，不追赶暂停或
+        阻塞期间流逝的时间。阻塞恢复后若容量仍不足，下一拍（注入 now 的
+        显式 tick 或后台线程的下一拍）会再次整批失败并回到 blocked（游标、
+        seq、队列不变）。未启动抛 not_started；running 抛
+        resume_paused_or_blocked。
+        """
+        if now is None:
+            now = time.monotonic()
+        with session.lock:
+            if session.closed:
+                raise SessionFinished(session.session_id)
+            status = session.autoplay_status
+            if status == AUTOPLAY_IDLE:
+                raise AutoplayConflict("not_started", status)
+            if status not in (AUTOPLAY_PAUSED, AUTOPLAY_BLOCKED):
+                raise AutoplayConflict("resume_paused_or_blocked", status)
+            session.autoplay_status = AUTOPLAY_RUNNING
+            session.base_cursor_ms = session.cursor_ms
+            session.base_monotonic_s = now
+            with self._registry_lock:
+                self._ensure_driver_locked()
+            return session.autoplay_state()
+
+    def autoplay_status_of(
+        self, session: PlaybackSession
+    ) -> Dict[str, Any]:
+        """查询自动播放状态与当前游标（未启动返回 idle）。"""
+        with session.lock:
+            if session.closed:
+                raise SessionFinished(session.session_id)
+            return session.autoplay_state()
+
+    def shutdown_driver(self) -> None:
+        """停止后台驱动（随 reset_playback 退役管理器时调用）。
+
+        已暂停/阻塞/运行的会话随管理器一同被丢弃；驱动线程在当前一拍
+        （每次只短暂持有会话锁）结束后退出，不影响替换后的新管理器。
+        """
+        self._driver_stop.set()
+        self._driver_wake.set()
 
     def accept(
         self,

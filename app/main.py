@@ -11,6 +11,7 @@ from . import storage as storage_module
 from .playback import (
     AcceptConflict,
     AckOutOfRange,
+    AutoplayConflict,
     ChannelCapacityExhausted,
     ChannelExists,
     ChannelMissing,
@@ -59,8 +60,16 @@ app = FastAPI(
         "不消费 seq、不部分入队）；未开启通道不占容量，无事件操作满额仍可执行。"
         "容量仅在确认并删除前缀或结束会话时释放（重复/并发结束不重复释放），"
         "释放后原请求可重试。"
+        "已开启补取通道且从未启动的会话还可启动自动播放：进程内后台驱动每 "
+        "50 毫秒按单调时钟经过的整毫秒自动推进游标（暂停、阻塞不计时，恢复 "
+        "从保留游标重新计时、不追赶停顿时间），沿用事件窗口、隐藏过滤、排序、"
+        "seq 与共享容量的全部规则——整批事件容量不足即转为阻塞，游标、seq 与"
+        "队列不变，确认释放后须显式恢复；可经 HTTP 启动、暂停、恢复、查询"
+        "（idle/running/paused/blocked），状态不符 409、未知会话 404，运行中"
+        "的两种手动推进 409，其他既有会话操作仍可用并完整串行；驱动状态仅存"
+        "单进程内存，旧接口响应不变。"
     ),
-    version="1.9.0",
+    version="1.10.0",
 )
 
 
@@ -432,6 +441,21 @@ class ChannelFetchResponse(BaseModel):
     events: List[ChannelEventOut]
 
 
+class AutoplayStateResponse(BaseModel):
+    """自动播放控制结果：状态与当前游标。
+
+    status 为 idle（未启动）/running（运行中）/paused（已暂停）/
+    blocked（容量满额阻塞）之一；cursor_ms 为后台最近一次成功推进保留的
+    游标（暂停、阻塞不计时，恢复后从该游标重新计时）。
+    """
+
+    session_id: str
+    status: Literal["idle", "running", "paused", "blocked"] = Field(
+        ..., description="自动播放状态：未启动/运行/暂停/阻塞"
+    )
+    cursor_ms: int = Field(..., description="当前播放游标（毫秒）")
+
+
 # ---------------------------------------------------------------------------
 # SQLite 存储：惰性单例，路径可用环境变量 SCENES_DB_PATH 覆盖
 # ---------------------------------------------------------------------------
@@ -477,6 +501,9 @@ def reset_playback() -> None:
     """清空全部播放会话（供测试隔离；会话本就不跨重启保留）。"""
     global _playback
     with _playback_lock:
+        if _playback is not None:
+            # 退役管理器时停止其自动播放后台驱动，避免旧线程跨管理器存活。
+            _playback.shutdown_driver()
         _playback = None
 
 
@@ -974,6 +1001,32 @@ def _channel_full_503(exc: ChannelCapacityExhausted) -> HTTPException:
     )
 
 
+# 自动播放状态迁移冲突 -> HTTP 409 的原因与提示文案。
+_AUTOPLAY_CONFLICT_MESSAGES = {
+    "channel_missing": "启动自动播放前必须先开启补取通道",
+    "already_started": "自动播放仅限从未启动的会话启动一次，暂停或阻塞后请用恢复",
+    "not_started": "会话尚未启动自动播放",
+    "pause_only_running": "暂停仅限运行中的自动播放会话",
+    "resume_paused_or_blocked": "恢复仅限暂停或阻塞中的自动播放会话",
+    "manual_advance_while_running": (
+        "自动播放运行中由后台按真实时间推进，不能手动推进；可先暂停"
+    ),
+}
+
+
+def _autoplay_conflict_409(exc: AutoplayConflict) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "message": _AUTOPLAY_CONFLICT_MESSAGES.get(
+                exc.reason, "自动播放状态迁移冲突"
+            ),
+            "reason": exc.reason,
+            "status": exc.status,
+        },
+    )
+
+
 def _get_session_or_404(session_id: str) -> PlaybackSession:
     session = get_playback().get(session_id)
     if session is None:
@@ -987,6 +1040,8 @@ def advance_session(session_id: str, req: AdvanceRequest) -> AdvanceResponse:
 
     返回源版本、游标，以及游标时刻处于 [start_ms, end_ms) 区间的字幕
     及其轨道。倒退返回 422 且会话不变；未知或已结束会话返回 404。
+    自动播放运行中的会话由后台按真实时间驱动，手动推进返回 409
+    （未启动/暂停/阻塞时仍可手动推进，阻塞满额时仍按 503 失败）。
     """
     session = _get_session_or_404(session_id)
     try:
@@ -994,6 +1049,8 @@ def advance_session(session_id: str, req: AdvanceRequest) -> AdvanceResponse:
     except SessionFinished:
         # 已取得引用但轮到生效时会话已被结束：与未知会话同等待遇
         raise _session_gone_404(session_id)
+    except AutoplayConflict as exc:
+        raise _autoplay_conflict_409(exc)
     except CursorRegression as exc:
         raise HTTPException(
             status_code=422,
@@ -1027,6 +1084,7 @@ def advance_session_events(
     在会话锁内与推进、接纳、结束完整串行；事件不保存历史、不提供重放。
 
     倒退或非法时间返回 422 且会话不变；未知或已结束会话返回 404。
+    自动播放运行中的会话手动事件推进返回 409。
     已开启通道且本次事件无法完整申请到共享容量时返回 503：游标不推进、
     seq 不分配、事件不部分入队，释放容量后可用同一请求重试。
     """
@@ -1035,6 +1093,8 @@ def advance_session_events(
         state = get_playback().advance_events(session, req.time_ms)
     except SessionFinished:
         raise _session_gone_404(session_id)
+    except AutoplayConflict as exc:
+        raise _autoplay_conflict_409(exc)
     except CursorRegression as exc:
         raise HTTPException(
             status_code=422,
@@ -1164,6 +1224,83 @@ def fetch_session_channel(
             },
         )
     return ChannelFetchResponse(**state)
+
+
+# ---------------------------------------------------------------------------
+# 自动播放：按真实经过时间推进（HTTP 启动/暂停/恢复/查询）
+# ---------------------------------------------------------------------------
+
+
+def _autoplay_call(session_id: str, action) -> AutoplayStateResponse:
+    """执行一个自动播放控制动作并统一映射会话级异常。"""
+    session = _get_session_or_404(session_id)
+    try:
+        state = action(get_playback(), session)
+    except SessionFinished:
+        raise _session_gone_404(session_id)
+    except AutoplayConflict as exc:
+        raise _autoplay_conflict_409(exc)
+    return AutoplayStateResponse(**state)
+
+
+@app.post(
+    "/sessions/{session_id}/autoplay/start",
+    response_model=AutoplayStateResponse,
+)
+def start_session_autoplay(session_id: str) -> AutoplayStateResponse:
+    """启动自动播放：让会话按真实经过时间自动推进，客户端不再逐次提交。
+
+    仅限**已开启补取通道且从未启动**（idle）的会话：成功后状态为
+    running，进程内后台驱动每 50 毫秒尝试推进一次，目标为本段起始游标
+    （即当前游标）加单调时钟经过的整毫秒。后台推进沿用事件窗口、隐藏
+    过滤、排序、seq 与共享容量的全部规则；一次推进整批入队，共享容量
+    不足时整批转为 blocked（游标、seq 与队列均不变），须确认释放容量后
+    显式恢复，不追赶停顿时间。
+
+    - 未开启补取通道或会话已启动（含运行/暂停/阻塞）：409；
+    - 未知或已结束会话：404。
+    """
+    return _autoplay_call(session_id, lambda pb, s: pb.start_autoplay(s))
+
+
+@app.post(
+    "/sessions/{session_id}/autoplay/pause",
+    response_model=AutoplayStateResponse,
+)
+def pause_session_autoplay(session_id: str) -> AutoplayStateResponse:
+    """暂停自动播放：仅限 running；暂停期间不计时。
+
+    保留游标停留在后台最近一次成功推进的值；暂停返回后在途后台任务进锁
+    即见非 running，不会再推进本会话。未启动返回 409；暂停或阻塞中再次
+    暂停返回 409；未知或已结束会话返回 404。
+    """
+    return _autoplay_call(session_id, lambda pb, s: pb.pause_autoplay(s))
+
+
+@app.post(
+    "/sessions/{session_id}/autoplay/resume",
+    response_model=AutoplayStateResponse,
+)
+def resume_session_autoplay(session_id: str) -> AutoplayStateResponse:
+    """恢复自动播放：仅限 paused 或 blocked；从保留游标重新计时。
+
+    以保留游标作为新一段起点重新记录单调时钟，不追赶暂停或阻塞期间流逝
+    的时间；阻塞恢复后若容量仍不足，下一拍会再次回到 blocked。未启动或
+    运行中返回 409；未知或已结束会话返回 404。
+    """
+    return _autoplay_call(session_id, lambda pb, s: pb.resume_autoplay(s))
+
+
+@app.get(
+    "/sessions/{session_id}/autoplay",
+    response_model=AutoplayStateResponse,
+)
+def get_session_autoplay(session_id: str) -> AutoplayStateResponse:
+    """查询自动播放状态：返回 idle/running/paused/blocked 与当前游标。
+
+    未启动的会话返回 idle；未知或已结束会话返回 404。
+    """
+    return _autoplay_call(session_id, lambda pb, s: pb.autoplay_status_of(s))
 
 
 @app.post("/sessions/{session_id}/accept", response_model=SessionStateResponse)
